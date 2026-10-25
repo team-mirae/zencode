@@ -1,0 +1,14 @@
+{
+    // No suggestion popups while typing, in code, comments or strings.
+    "editor.quickSuggestions": {
+        "other": "off",
+        "comments": "off",
+        "strings": "off"
+    },
+    "editor.suggestOnTriggerCharacters": false,
+    "editor.wordBasedSuggestions": "off",
+    "editor.parameterHints.enabled": false,
+    // No inline ghost-text completions (including AI ones).
+    "editor.inlineSuggest.enabled": false,
+    "editor.acceptSuggestionOnEnter": "off"
+}

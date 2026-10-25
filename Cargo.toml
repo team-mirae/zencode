@@ -1,0 +1,22 @@
+[package]
+name = "zencode"
+version = "0.1.0"
+edition = "2024"
+description = "A nano-style terminal text editor with first-class 全角 (한글 / 日本語) support"
+license = "MIT"
+readme = "README.md"
+keywords = ["editor", "terminal", "cjk", "korean", "japanese"]
+categories = ["command-line-utilities", "text-editors"]
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+crossterm = "0.29.0"
+inputx-nihongo = "1.4.0"
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
