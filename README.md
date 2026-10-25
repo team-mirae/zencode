@@ -22,7 +22,8 @@ set the variables on the `sh` side of the pipe:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/team-mirae/zencode/main/install.sh | ZENCODE_VERSION=v0.1.0 ZENCODE_INSTALL_DIR=/usr/local/bin sh
 ```
- Windows builds are on the
+
+Windows builds are on the
 [releases page](https://github.com/team-mirae/zencode/releases).
 
 From source:
