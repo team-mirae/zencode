@@ -2,6 +2,7 @@
 name = "zencode"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 description = "A nano-style terminal text editor with first-class 全角 (한글 / 日本語) support"
 license = "MIT"
 readme = "README.md"
