@@ -20,7 +20,10 @@ use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::queue;
 use crossterm::style::{
     Attribute, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
@@ -40,29 +43,53 @@ use crate::text::{
 use crate::theme::{ColorDepth, Rgb, Theme};
 
 const STATUS_TTL: Duration = Duration::from_secs(4);
+/// Clicks on the same cell within this long count as a double / triple click.
+const MULTI_CLICK: Duration = Duration::from_millis(400);
+const WHEEL_LINES: isize = 3;
 
 /// Always-visible shortcut bar, alternatives included. The bar fills
 /// row by row; the order keeps the long entries in one column, so four
 /// columns fit in 80.
-const SHORTCUTS: &[(&str, &str)] = &[
-    ("⌃X", "Exit"),
-    ("⌃S", "Save"),
-    ("⌃O", "Export"),
-    ("⌃⇧X", "Force Exit"),
-    ("⌃F", "Find"),
-    ("⌃G", "Find Exact"),
-    ("⌃/ F1", "Help"),
-    ("⌃←→/⌥←→", "Letterblock"),
-    ("⌃C", "Copy"),
-    ("⌃B", "Extract"),
-    ("⌃V", "Paste"),
-    ("⌃/⌥ ⌫⌦", "Delete Letterblock"),
-    ("⌃A", "Select All"),
-    ("⇧←→↑↓", "Select"),
-    ("⌃E/⌥E", "Undo"),
-    ("⌃↑↓/⌥↑↓", "Move Line"),
-    ("⌃R/⌥R", "Redo"),
+///
+/// Entries with an action can also be clicked. Those without are either
+/// movement keys or not safe to trigger by a stray click (⌃⇧X discards
+/// changes).
+const SHORTCUTS: &[(&str, &str, Option<Action>)] = &[
+    ("⌃X", "Exit", Some(Action::Exit)),
+    ("⌃S", "Save", Some(Action::Save)),
+    ("⌃O", "Export", Some(Action::Export)),
+    ("⌃⇧X", "Force Exit", None),
+    ("⌃F", "Find", Some(Action::Find)),
+    ("⌃G", "Find Exact", Some(Action::FindExact)),
+    ("⌃/ F1", "Help", Some(Action::Help)),
+    ("⌃←→/⌥←→", "Letterblock", None),
+    ("⌃C", "Copy", Some(Action::Copy)),
+    ("⌃B", "Extract", Some(Action::Extract)),
+    ("⌃V", "Paste", Some(Action::Paste)),
+    ("⌃/⌥ ⌫⌦", "Delete Letterblock", None),
+    ("⌃A", "Select All", Some(Action::SelectAll)),
+    ("⇧←→↑↓", "Select", None),
+    ("⌃E/⌥E", "Undo", Some(Action::Undo)),
+    ("⌃↑↓/⌥↑↓", "Move Line", None),
+    ("⌃R/⌥R", "Redo", Some(Action::Redo)),
 ];
+
+/// Commands reachable from both a key and a click on the shortcut bar.
+#[derive(Clone, Copy)]
+enum Action {
+    Exit,
+    Save,
+    Export,
+    Find,
+    FindExact,
+    Help,
+    Copy,
+    Extract,
+    Paste,
+    SelectAll,
+    Undo,
+    Redo,
+}
 
 /// Shown below the brand header in the help box.
 const HELP_LINES: &[&str] = &[
@@ -146,6 +173,15 @@ struct SearchState {
     candidates: Vec<String>,
 }
 
+/// The last left click, for double / triple click and dragging.
+struct Click {
+    at: Instant,
+    cell: (u16, u16),
+    count: u8,
+    /// Where the press landed, as the anchor for a drag.
+    origin: Pos,
+}
+
 struct Status {
     text: String,
     error: bool,
@@ -203,6 +239,12 @@ pub struct Editor {
     /// Content state now and at the last save; they differ when modified.
     state: u64,
     saved_state: u64,
+    last_click: Option<Click>,
+    /// Clickable shortcut under the mouse pointer.
+    hover: Option<usize>,
+    /// Keep the cursor in view. Turned off while the wheel scrolls the view
+    /// on its own, and back on with the next key press or click.
+    follow_cursor: bool,
     quit: bool,
 }
 
@@ -232,6 +274,9 @@ impl Editor {
             history: History::default(),
             state: 0,
             saved_state: 0,
+            last_click: None,
+            hover: None,
+            follow_cursor: true,
             quit: false,
         };
         if created {
@@ -244,29 +289,59 @@ impl Editor {
     }
 
     pub fn run(&mut self, out: &mut impl Write) -> Result<()> {
+        let mut redraw = true;
         while !self.quit {
-            self.draw(out)?;
+            if redraw {
+                self.draw(out)?;
+            }
             // Poll with a timeout so expired status messages get cleared.
             if !event::poll(Duration::from_millis(500))? {
+                redraw = self.status.is_some();
                 continue;
             }
-            match event::read()? {
+            redraw = match event::read()? {
                 // Windows reports key releases too; only act on presses.
-                Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
-                Event::Paste(s) => self.on_paste(&s),
+                Event::Key(k) if k.kind != KeyEventKind::Release => {
+                    self.on_key(k);
+                    true
+                }
+                Event::Paste(s) => {
+                    self.on_paste(&s);
+                    true
+                }
+                Event::Mouse(m) => self.on_mouse(m),
                 Event::Resize(w, h) => {
                     self.width = w;
                     self.height = h;
+                    true
                 }
-                _ => {}
-            }
+                _ => false,
+            };
         }
         Ok(())
+    }
+
+    fn perform(&mut self, action: Action) {
+        match action {
+            Action::Exit => self.try_quit(),
+            Action::Save => self.save(false),
+            Action::Export => self.open_prompt(PromptKind::Export),
+            Action::Find => self.open_search(false),
+            Action::FindExact => self.open_search(true),
+            Action::Help => self.show_help = true,
+            Action::Copy => self.copy(),
+            Action::Extract => self.extract(),
+            Action::Paste => self.paste(),
+            Action::SelectAll => self.select_all(),
+            Action::Undo => self.undo(),
+            Action::Redo => self.redo(),
+        }
     }
 
     // ----- input -------------------------------------------------------
 
     fn on_key(&mut self, k: KeyEvent) {
+        self.follow_cursor = true;
         if self.show_help {
             self.show_help = false;
             return;
@@ -284,21 +359,21 @@ impl Editor {
             // ⌃⇧X is only distinguishable from ⌃X in terminals that speak
             // the kitty keyboard protocol; elsewhere it exits gracefully.
             KeyCode::Char(c) if ctrl && (c == 'X' || (c == 'x' && shift)) => self.quit = true,
-            KeyCode::Char('x') if ctrl => self.try_quit(),
-            KeyCode::Char('s') if ctrl => self.save(false),
-            KeyCode::Char('o') if ctrl => self.open_prompt(PromptKind::Export),
-            KeyCode::Char('f') if ctrl => self.open_search(false),
-            KeyCode::Char('g') if ctrl => self.open_search(true),
+            KeyCode::Char('x') if ctrl => self.perform(Action::Exit),
+            KeyCode::Char('s') if ctrl => self.perform(Action::Save),
+            KeyCode::Char('o') if ctrl => self.perform(Action::Export),
+            KeyCode::Char('f') if ctrl => self.perform(Action::Find),
+            KeyCode::Char('g') if ctrl => self.perform(Action::FindExact),
             // ⌃/ arrives as ^_ (0x1F) in most terminals, which crossterm
             // reports as ⌃7; with the kitty protocol it's a real ⌃/.
-            KeyCode::Char('/' | '7' | '_') if ctrl => self.show_help = true,
-            KeyCode::F(1) => self.show_help = true,
-            KeyCode::Char('c') if ctrl => self.copy(),
-            KeyCode::Char('b') if ctrl => self.extract(),
-            KeyCode::Char('v') if ctrl => self.paste(),
-            KeyCode::Char('a') if ctrl => self.select_all(),
-            KeyCode::Char('e') if ctrl || alt => self.undo(),
-            KeyCode::Char('r') if ctrl || alt => self.redo(),
+            KeyCode::Char('/' | '7' | '_') if ctrl => self.perform(Action::Help),
+            KeyCode::F(1) => self.perform(Action::Help),
+            KeyCode::Char('c') if ctrl => self.perform(Action::Copy),
+            KeyCode::Char('b') if ctrl => self.perform(Action::Extract),
+            KeyCode::Char('v') if ctrl => self.perform(Action::Paste),
+            KeyCode::Char('a') if ctrl => self.perform(Action::SelectAll),
+            KeyCode::Char('e') if ctrl || alt => self.perform(Action::Undo),
+            KeyCode::Char('r') if ctrl || alt => self.perform(Action::Redo),
             // Many terminals send ⌃⌫ as ^H, and iTerm2's "natural text
             // editing" sends ⌥⌫ as ^W and ⌥⌦ as ESC d.
             KeyCode::Char('h' | 'w') if ctrl => self.delete_block(true),
@@ -345,6 +420,144 @@ impl Editor {
             }
             _ => {}
         }
+    }
+
+    /// Click to place the cursor (⇧ to extend the selection), drag to
+    /// select, double-click to select a letterblock, triple-click to
+    /// select the line, and scroll with the wheel.
+    /// Returns whether the screen needs redrawing; plain pointer movement
+    /// only does when it changes which shortcut is hovered.
+    fn on_mouse(&mut self, m: MouseEvent) -> bool {
+        if let MouseEventKind::Moved = m.kind {
+            let hover = self
+                .shortcut_at(m.column, m.row)
+                .filter(|_| self.prompt.is_none());
+            return std::mem::replace(&mut self.hover, hover) != hover;
+        }
+        if self.show_help {
+            if let MouseEventKind::Down(_) = m.kind {
+                self.show_help = false;
+            }
+            return true;
+        }
+        if self.prompt.is_some() {
+            return false;
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind
+            && let Some(i) = self.shortcut_at(m.column, m.row)
+        {
+            self.follow_cursor = true;
+            if let Some(action) = SHORTCUTS[i].2 {
+                self.perform(action);
+            }
+            return true;
+        }
+        self.on_text_mouse(m);
+        true
+    }
+
+    /// Index of the clickable shortcut under a screen cell.
+    fn shortcut_at(&self, x: u16, y: u16) -> Option<usize> {
+        let bar_y = 2 + self.text_rows();
+        let (cols, rows) = self.shortcut_layout();
+        let r = (y as usize).checked_sub(bar_y).filter(|&r| r < rows)?;
+        let mut left = 0;
+        for (c, &w) in cols.iter().enumerate() {
+            if (left..left + w).contains(&(x as usize)) {
+                let i = r * cols.len() + c;
+                return SHORTCUTS.get(i).and_then(|s| s.2).map(|_| i);
+            }
+            left += w;
+        }
+        None
+    }
+
+    /// Mouse events over the text: click, drag, multi-click and wheel.
+    fn on_text_mouse(&mut self, m: MouseEvent) {
+        match m.kind {
+            MouseEventKind::ScrollUp => self.scroll_view(-WHEEL_LINES),
+            MouseEventKind::ScrollDown => self.scroll_view(WHEEL_LINES),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some((row, col)) = self.cell_to_text(m.column, m.row, false) else {
+                    return;
+                };
+                let cell = (m.column, m.row);
+                let count = match &self.last_click {
+                    Some(c) if c.cell == cell && c.at.elapsed() < MULTI_CLICK => c.count % 3 + 1,
+                    _ => 1,
+                };
+                self.follow_cursor = true;
+                self.history.break_step();
+                let line = &self.buf.lines[row];
+                let origin = (row, nearest_boundary(line, col));
+                match count {
+                    1 if m.modifiers.contains(KeyModifiers::SHIFT) => {
+                        self.anchor.get_or_insert((self.cy, self.cx));
+                        self.move_to(origin);
+                    }
+                    1 => {
+                        self.anchor = None;
+                        self.move_to(origin);
+                    }
+                    2 => {
+                        let block = letterblock::block_at(line, gidx_for_col(line, col));
+                        self.anchor = Some((row, block.start));
+                        self.move_to((row, block.end));
+                    }
+                    _ => {
+                        let len = self.buf.line_len(row);
+                        self.anchor = Some((row, 0));
+                        self.move_to((row, len));
+                    }
+                }
+                self.last_click = Some(Click {
+                    at: Instant::now(),
+                    cell,
+                    count,
+                    origin,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(origin) = self.last_click.as_ref().map(|c| c.origin) else {
+                    return;
+                };
+                let Some((row, col)) = self.cell_to_text(m.column, m.row, true) else {
+                    return;
+                };
+                self.follow_cursor = true;
+                self.anchor.get_or_insert(origin);
+                let gidx = nearest_boundary(&self.buf.lines[row], col);
+                self.move_to((row, gidx));
+            }
+            _ => {}
+        }
+    }
+
+    /// Map a screen cell to (buffer row, display column). Outside the text
+    /// area this gives `None`, unless `clamp` pins it to the nearest row,
+    /// as a drag past the edge should.
+    fn cell_to_text(&self, x: u16, y: u16, clamp: bool) -> Option<(usize, usize)> {
+        let rows = self.text_rows();
+        if rows == 0 {
+            return None;
+        }
+        let y = y as usize;
+        let screen_row = if (1..=rows).contains(&y) {
+            y - 1
+        } else if clamp {
+            y.clamp(1, rows) - 1
+        } else {
+            return None;
+        };
+        let row = (self.row_off + screen_row).min(self.buf.lines.len() - 1);
+        let col = (x as usize).saturating_sub(self.gutter_width()) + self.col_off;
+        Some((row, col))
+    }
+
+    fn scroll_view(&mut self, delta: isize) {
+        let last = self.buf.lines.len().saturating_sub(1);
+        self.row_off = self.row_off.saturating_add_signed(delta).min(last);
+        self.follow_cursor = false;
     }
 
     /// Bracketed paste: text coming from the system clipboard via the
@@ -885,7 +1098,7 @@ impl Editor {
         let width = self.width as usize;
         let items: Vec<usize> = SHORTCUTS
             .iter()
-            .map(|(k, l)| str_width(k) + 1 + str_width(l) + 2)
+            .map(|(k, l, _)| str_width(k) + 1 + str_width(l) + 2)
             .collect();
         let mut cols = vec![width];
         for n in (1..=items.len()).rev() {
@@ -921,6 +1134,9 @@ impl Editor {
     }
 
     fn scroll(&mut self) {
+        if !self.follow_cursor {
+            return;
+        }
         let rows = self.text_rows().max(1);
         if self.cy < self.row_off {
             self.row_off = self.cy;
@@ -989,17 +1205,16 @@ impl Editor {
             self.draw_help(out)?;
         }
 
-        let (x, y) = cursor.unwrap_or_else(|| {
-            let line = &self.buf.lines[self.cy];
-            let col = display_col(line, self.cx) - self.col_off;
-            (
-                (self.gutter_width() + col) as u16,
-                (1 + self.cy - self.row_off) as u16,
-            )
+        // The cursor may be off screen while the wheel scrolls the view.
+        let cursor = cursor.or_else(|| {
+            let col = display_col(&self.buf.lines[self.cy], self.cx).checked_sub(self.col_off)?;
+            let row = self.cy.checked_sub(self.row_off)?;
+            (row < self.text_rows() && col < self.text_width())
+                .then(|| ((self.gutter_width() + col) as u16, (1 + row) as u16))
         });
-        queue!(out, ResetColor, MoveTo(x, y))?;
-        if !self.show_help {
-            queue!(out, Show)?;
+        queue!(out, ResetColor)?;
+        if let Some((x, y)) = cursor.filter(|_| !self.show_help) {
+            queue!(out, MoveTo(x, y), Show)?;
         }
         queue!(out, EndSynchronizedUpdate)?;
         out.flush()?;
@@ -1309,8 +1524,12 @@ impl Editor {
         for r in 0..rows {
             queue!(out, MoveTo(0, y + r as u16))?;
             let mut used = 0;
-            let row = SHORTCUTS.iter().skip(r * cols.len()).take(cols.len());
-            for ((key, label), &cell) in row.zip(&cols) {
+            let row = SHORTCUTS
+                .iter()
+                .enumerate()
+                .skip(r * cols.len())
+                .take(cols.len());
+            for ((i, (key, label, _)), &cell) in row.zip(&cols) {
                 let (key, kw) = truncate(key, cell);
                 self.colors(out, t.key_fg, t.key_bg)?;
                 if t.mono() {
@@ -1322,9 +1541,25 @@ impl Editor {
                 let rest = cell - kw;
                 let label = format!(" {label}");
                 let (label, lw) = truncate(&label, rest);
-                self.colors(out, t.label_fg, t.bar_bg)?;
-                queue!(out, Print(label))?;
-                Self::spaces(out, rest - lw)?;
+                if self.hover == Some(i) {
+                    // Highlight the label, but not the gap after it.
+                    self.colors(out, t.fg, t.select_bg)?;
+                    if t.mono() {
+                        queue!(out, SetAttribute(Attribute::Underlined))?;
+                    }
+                    queue!(
+                        out,
+                        Print(label),
+                        Print(" "),
+                        SetAttribute(Attribute::Reset)
+                    )?;
+                    self.colors(out, t.label_fg, t.bar_bg)?;
+                    Self::spaces(out, (rest - lw).saturating_sub(1))?;
+                } else {
+                    self.colors(out, t.label_fg, t.bar_bg)?;
+                    queue!(out, Print(label))?;
+                    Self::spaces(out, rest - lw)?;
+                }
                 used += cell;
             }
             self.colors(out, t.label_fg, t.bar_bg)?;
@@ -1372,6 +1607,19 @@ impl Editor {
             queue!(out, SetAttribute(Attribute::Reset))?;
         }
         Ok(())
+    }
+}
+
+/// Grapheme boundary nearest to display column `col`: clicking the right
+/// half of a full-width character puts the cursor after it.
+fn nearest_boundary(line: &str, col: usize) -> usize {
+    let gidx = gidx_for_col(line, col);
+    let start = display_col(line, gidx);
+    let w = width_at(line, gidx);
+    if gidx < grapheme_count(line) && col - start >= w.div_ceil(2) && w > 1 {
+        gidx + 1
+    } else {
+        gidx
     }
 }
 

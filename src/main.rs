@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use crossterm::cursor::Show;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::style::ResetColor;
@@ -67,6 +67,9 @@ impl TerminalGuard {
         // Not every console supports bracketed paste; it's fine without it.
         // Sandboxed mode relies on it to recognize and refuse pastes.
         let _ = execute!(io::stdout(), EnableBracketedPaste);
+        // Clicks, drags and the wheel. The terminal's own mouse selection
+        // then needs a modifier (⌥ on macOS, ⇧ on most Linux terminals).
+        let _ = execute!(io::stdout(), EnableMouseCapture);
         // The kitty keyboard protocol lets ⌃⇧X arrive as something other
         // than plain ⌃X. Terminals without it just send ⌃X.
         if matches!(supports_keyboard_enhancement(), Ok(true))
@@ -92,6 +95,7 @@ fn restore_terminal() {
     if KEYBOARD_ENHANCED.swap(false, Ordering::SeqCst) {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
+    let _ = execute!(io::stdout(), DisableMouseCapture);
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     let _ = execute!(io::stdout(), ResetColor, Show, LeaveAlternateScreen);
     let _ = disable_raw_mode();

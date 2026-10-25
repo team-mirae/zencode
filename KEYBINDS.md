@@ -13,7 +13,7 @@ Support for other non-latin languages are out of scope.
 The core principle behind zencode is **read, then write**. macOS UX design insists
 on creating the file first, using an application, then saving to disk. zencode does the opposite.
 
-A file is created before zencode is launched. It the filename provided as the
+A file is created before zencode is launched. If the filename provided as the
 launch argument does not exist, zencode will create it for you.
 
 If no filename is specified, zencode will not start. We will not invent arbitrary filenames

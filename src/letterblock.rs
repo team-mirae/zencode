@@ -200,6 +200,21 @@ pub fn left(s: &str, gidx: usize) -> usize {
         .map_or(0, |b| b.start)
 }
 
+/// The letterblock under `gidx`, for double-click. Between blocks this is
+/// the run of whitespace there; past the end of the line it is the last
+/// block.
+pub fn block_at(s: &str, gidx: usize) -> Range<usize> {
+    let len = s.graphemes(true).count();
+    let gidx = gidx.min(len.saturating_sub(1));
+    let bs = blocks(s);
+    if let Some(b) = bs.iter().find(|b| b.contains(&gidx)) {
+        return b.clone();
+    }
+    let start = bs.iter().rev().find(|b| b.end <= gidx).map_or(0, |b| b.end);
+    let end = bs.iter().find(|b| b.start > gidx).map_or(len, |b| b.start);
+    start..end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +262,17 @@ mod tests {
             split("아마존웹서비시즈유한책임회사"),
             ["아마존웹서비시즈유한책임회사"]
         );
+    }
+
+    #[test]
+    fn block_under_a_position() {
+        let s = "학교에서는  日本語の";
+        assert_eq!(block_at(s, 0), 0..2);
+        assert_eq!(block_at(s, 3), 2..5);
+        assert_eq!(block_at(s, 5), 5..7);
+        assert_eq!(block_at(s, 8), 7..10);
+        assert_eq!(block_at(s, 99), 10..11);
+        assert_eq!(block_at("", 0), 0..0);
     }
 
     #[test]

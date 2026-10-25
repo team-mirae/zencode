@@ -7,6 +7,39 @@ and the cursor, scrolling and line clipping all account for that.
 Runs on Linux, macOS and Windows. Rendering goes through
 [crossterm](https://github.com/crossterm-rs/crossterm).
 
+## Install
+
+On Linux or macOS, including over ssh:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/team-mirae/zencode/main/install.sh | sh
+```
+
+This installs the latest release into `~/.local/bin`, with no sudo needed,
+and verifies its SHA-256 checksum. To pin a release or pick the directory,
+set the variables on the `sh` side of the pipe:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/team-mirae/zencode/main/install.sh | ZENCODE_VERSION=v0.1.0 ZENCODE_INSTALL_DIR=/usr/local/bin sh
+```
+ Windows builds are on the
+[releases page](https://github.com/team-mirae/zencode/releases).
+
+From source:
+
+```sh
+cargo install --git https://github.com/team-mirae/zencode
+```
+
+## Usage
+
+```sh
+zencode path/to/file.txt      # created if it doesn't exist
+zencode -s secrets.env        # sandboxed clipboard
+```
+
+For development:
+
 ```sh
 cargo run --release -- path/to/file.txt      # created if it doesn't exist
 cargo run --release -- -s secrets.env        # sandboxed clipboard
@@ -58,6 +91,20 @@ has no dictionary, so it still gets some nouns wrong (고양이 → 고양|이).
 Terminals often send ⌃⌫ as ⌃H, and iTerm2's "natural text editing"
 preset sends ⌥⌫ as ⌃W and ⌥⌦ as ⌥D; zencode treats all of these as
 letterblock deletes.
+
+### Mouse
+
+Click to place the cursor, ⇧+click or drag to select, double-click to
+select a letterblock (the same rules as ⌃/⌥ + ←→), and triple-click to
+select the line. The wheel scrolls the view without moving the cursor.
+
+Shortcuts in the bar can be clicked too, and highlight when the pointer is
+over them: Exit, Save, Export, Find, Find Exact, Help, Copy, Extract,
+Paste, Select All, Undo and Redo. Force Exit is deliberately not
+clickable, and movement keys like Letterblock and Move Line are only hints.
+
+zencode captures the mouse, so for your terminal's own text selection hold
+⌥ (iTerm2, Terminal.app) or ⇧ (most Linux terminals) while dragging.
 
 ### Search
 
