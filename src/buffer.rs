@@ -18,6 +18,15 @@ pub enum LineEnding {
 }
 
 impl LineEnding {
+    /// The platform's own, for new files.
+    pub fn native() -> Self {
+        if cfg!(windows) {
+            LineEnding::CrLf
+        } else {
+            LineEnding::Lf
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             LineEnding::Lf => "\n",
@@ -37,11 +46,15 @@ pub type Pos = (usize, usize);
 
 pub struct Buffer {
     pub lines: Vec<String>,
-    pub path: PathBuf,
+    /// `None` for text read from standard input, until it is saved.
+    pub path: Option<PathBuf>,
     /// Bumped on every mutation, so callers can tell whether an edit
     /// actually changed anything.
     pub revision: u64,
     pub line_ending: LineEnding,
+    /// End the file with a line break when writing it. Set when the file
+    /// had one; zencode adds one anyway unless `-L` / `--nonewlines`.
+    pub final_newline: bool,
 }
 
 impl Buffer {
@@ -64,18 +77,14 @@ impl Buffer {
         let Ok(content) = String::from_utf8(bytes) else {
             bail!("{} is not valid UTF-8", path.display());
         };
-        let mut buf = Self::from_text(path.to_path_buf(), &content);
+        let mut buf = Self::from_text(Some(path.to_path_buf()), &content);
         if created {
-            buf.line_ending = if cfg!(windows) {
-                LineEnding::CrLf
-            } else {
-                LineEnding::Lf
-            };
+            buf.line_ending = LineEnding::native();
         }
         Ok((buf, created))
     }
 
-    pub fn from_text(path: PathBuf, content: &str) -> Self {
+    pub fn from_text(path: Option<PathBuf>, content: &str) -> Self {
         let line_ending = if content.contains("\r\n") {
             LineEnding::CrLf
         } else {
@@ -95,19 +104,18 @@ impl Buffer {
             path,
             revision: 0,
             line_ending,
+            final_newline: content.ends_with('\n'),
         }
     }
 
-    /// Write the buffer to its own path, returning the number of lines written.
-    pub fn save(&self) -> Result<usize> {
-        self.write_to(&self.path)
-    }
-
-    /// Write a copy of the buffer to `path` without rebinding the buffer.
+    /// Write the buffer to `path`, returning the number of lines written.
+    /// The buffer stays bound to its own path.
     pub fn write_to(&self, path: &Path) -> Result<usize> {
         let eol = self.line_ending.as_str();
         let mut out = self.lines.join(eol);
-        out.push_str(eol);
+        if self.final_newline {
+            out.push_str(eol);
+        }
         fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
         Ok(self.lines.len())
     }
@@ -253,7 +261,7 @@ mod tests {
     use super::*;
 
     fn empty() -> Buffer {
-        Buffer::from_text(PathBuf::new(), "")
+        Buffer::from_text(None, "")
     }
 
     #[test]
@@ -286,7 +294,7 @@ mod tests {
 
     #[test]
     fn range_extract_and_delete() {
-        let mut b = Buffer::from_text(PathBuf::new(), "한글abc\n日本語\nxyz");
+        let mut b = Buffer::from_text(None, "한글abc\n日本語\nxyz");
         assert_eq!(b.text_range((0, 1), (2, 1)), "글abc\n日本語\nx");
         b.delete_range((0, 1), (2, 1));
         assert_eq!(b.lines, vec!["한yz"]);
@@ -294,7 +302,7 @@ mod tests {
 
     #[test]
     fn move_lines_swaps_with_neighbor() {
-        let mut b = Buffer::from_text(PathBuf::new(), "a\nb\nc\nd");
+        let mut b = Buffer::from_text(None, "a\nb\nc\nd");
         assert!(b.move_lines(1, 2, true));
         assert_eq!(b.lines, vec!["b", "c", "a", "d"]);
         assert!(b.move_lines(0, 1, false));

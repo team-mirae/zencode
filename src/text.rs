@@ -4,11 +4,21 @@
 //! byte or `char`, so combining marks and emoji sequences stay intact.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-pub const TAB_WIDTH: usize = 4;
+static TAB_WIDTH: AtomicUsize = AtomicUsize::new(4);
+
+/// Columns between tab stops; `-T` / `--tabsize` changes it at startup.
+pub fn tab_width() -> usize {
+    TAB_WIDTH.load(Ordering::Relaxed)
+}
+
+pub fn set_tab_width(n: usize) {
+    TAB_WIDTH.store(n.max(1), Ordering::Relaxed);
+}
 
 /// Some East Asian terminal setups render "ambiguous width" characters
 /// (·, ─, →, ①, …) as two columns. Set `ZENCODE_AMBIGUOUS_WIDE=1` to match.
@@ -29,7 +39,8 @@ pub fn is_control(g: &str) -> bool {
 /// `col` only matters for tabs, which expand to the next tab stop.
 pub fn grapheme_width(g: &str, col: usize) -> usize {
     if g == "\t" {
-        return TAB_WIDTH - col % TAB_WIDTH;
+        let tab = tab_width();
+        return tab - col % tab;
     }
     if is_control(g) {
         return 1;
@@ -142,9 +153,9 @@ mod tests {
 
     #[test]
     fn tabs_expand_to_stops() {
-        assert_eq!(str_width("\t"), TAB_WIDTH);
-        assert_eq!(str_width("a\t"), TAB_WIDTH);
-        assert_eq!(str_width("한\tx"), TAB_WIDTH + 1);
+        assert_eq!(str_width("\t"), tab_width());
+        assert_eq!(str_width("a\t"), tab_width());
+        assert_eq!(str_width("한\tx"), tab_width() + 1);
     }
 
     #[test]

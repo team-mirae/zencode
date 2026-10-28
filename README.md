@@ -49,6 +49,59 @@ cargo run --release -- -s secrets.env        # sandboxed clipboard
 Running `zencode` with no file prints the version, since zencode never
 picks a file name for you.
 
+`zencode --help` lists every option. The command line follows nano's, so
+zencode works as `$EDITOR` / `$VISUAL` for git, `crontab -e`, Claude Code
+(⌃G) and anything else that starts an editor:
+
+```sh
+zencode +12 notes.txt          # start on line 12
+zencode +12,5 notes.txt        # line 12, column 5
+zencode +-1 notes.txt          # last line (negatives count from the end)
+zencode +/TODO notes.txt       # first match of TODO; +?TODO for the last
+zencode +c/Todo notes.txt      # the same, case-sensitive (exact) search
+zencode -g notes.txt:12:5      # VS Code's form; notes.txt:12 alone works
+                               # too when notes.txt exists
+zencode a.txt b.txt            # edit one after the other; ⌃X moves on
+some-command | zencode -       # edit text from standard input
+zencode -- -odd-name           # everything after -- is a file name
+```
+
+Columns count characters, so 한 is one column here even though it takes
+two cells on screen. With `-g` (or nano's `-@`) a trailing `:LINE[:COL]`
+is always read as a position unless a file with the literal name exists.
+Text read from standard input asks for a file name when you save it.
+
+nano's behaviour options are supported where zencode has the feature:
+
+| Option                  | Effect                                               |
+|-------------------------|------------------------------------------------------|
+| `-v`, `--view`          | View only; the buffer can't be changed               |
+| `-t`, `--saveonexit`    | ⌃X saves changes without asking                      |
+| `-T N`, `--tabsize=N`   | Tab stops every N columns (default 4)                |
+| `-E`, `--tabstospaces`  | Tab inserts spaces up to the next stop               |
+| `-i`, `--autoindent`    | Enter keeps the current line's indentation           |
+| `-L`, `--nonewlines`    | Don't add a line break at the end of the file        |
+| `-u`, `--unix`          | Save with LF line endings                            |
+| `-k`, `--cutfromcursor` | ⌃B with no selection cuts to the end of the line     |
+| `-B`, `--backup`        | Keep the original as `FILE~` on the first save       |
+| `-C DIR`, `--backupdir` | Keep that backup in DIR instead, named after the full path (implies `-B`) |
+| `-n`, `--noread`        | Start empty and only write the file (named pipes)    |
+| `-R`, `--restricted`    | No export (⌃O) and no backups                        |
+| `-x`, `--nohelp`        | Hide the shortcut bar                                |
+| `--nomouse`             | Leave the mouse to the terminal                      |
+
+Other nano options are accepted and ignored, together with their
+arguments, and so are `-w` / `--wait`, which some tools add for GUI
+editors. Two short options differ from nano: `-s` is `--sandboxed` (nano's
+`-s` sets a spell checker), and `-g` is VS Code's `--goto` (nano's is
+`--showcursor`). Unknown options print a one-line error to stderr and exit
+with status 1; a normal exit with ⌃X is always status 0.
+
+On exit zencode puts bracketed paste and cursor visibility back the way it
+found them (XTSAVE / XTRESTORE), so a program that handed over its terminal,
+like Claude Code, gets them back. In terminals without XTRESTORE both end up
+off and visible, as with most editors.
+
 ## Keys
 
 The full spec is in [KEYBINDS.md](KEYBINDS.md). Every major key is also
@@ -57,6 +110,7 @@ shown in the shortcut bar at the bottom of the screen.
 | Key               | Action                       |
 |-------------------|------------------------------|
 | ⌃X / ⌃⇧X          | Exit / exit without warning  |
+| ⌃Q or ⌥Q          | Exit, the same as ⌃X         |
 | ⌃S / ⌃O           | Save / export to a new file  |
 | ⌃C / ⌃B / ⌃V      | Copy / extract (cut) / paste |
 | ⌃A                | Select all                   |

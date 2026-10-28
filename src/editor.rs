@@ -12,11 +12,12 @@
 //! shortcut bar are the exception; they are measured with the same width
 //! rules as the text, so `ZENCODE_AMBIGUOUS_WIDE=1` keeps the layout right.
 
+use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -32,13 +33,14 @@ use crossterm::terminal::{self, BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::brand;
-use crate::buffer::{Buffer, Pos};
+use crate::buffer::{Buffer, LineEnding, Pos};
+use crate::cli::{Goto, Settings, Source};
 use crate::history::{EditKind, History, Snapshot};
 use crate::letterblock;
 use crate::search::{Match, Matcher};
 use crate::text::{
-    display_col, gidx_for_col, grapheme_count, grapheme_width, is_control, str_width, truncate,
-    width_at,
+    display_col, gidx_for_col, grapheme_count, grapheme_width, is_control, str_width, tab_width,
+    truncate, width_at,
 };
 use crate::theme::{ColorDepth, Rgb, Theme};
 
@@ -46,6 +48,7 @@ const STATUS_TTL: Duration = Duration::from_secs(4);
 /// Clicks on the same cell within this long count as a double / triple click.
 const MULTI_CLICK: Duration = Duration::from_millis(400);
 const WHEEL_LINES: isize = 3;
+const VIEW_ONLY: &str = "View mode: the buffer can't be changed";
 
 /// Always-visible shortcut bar, alternatives included. The bar fills
 /// row by row; the order keeps the long entries in one column, so four
@@ -55,7 +58,7 @@ const WHEEL_LINES: isize = 3;
 /// movement keys or not safe to trigger by a stray click (⌃⇧X discards
 /// changes).
 const SHORTCUTS: &[(&str, &str, Option<Action>)] = &[
-    ("⌃X", "Exit", Some(Action::Exit)),
+    ("⌃X/⌃Q/⌥Q", "Exit", Some(Action::Exit)),
     ("⌃S", "Save", Some(Action::Save)),
     ("⌃O", "Export", Some(Action::Export)),
     ("⌃⇧X", "Force Exit", None),
@@ -96,6 +99,7 @@ const HELP_LINES: &[&str] = &[
     "A nano-style 全角 text editor",
     "",
     "⌃X   Exit                ⌃⇧X  Exit without saving",
+    "⌃Q   Exit  (or ⌥Q)",
     "⌃S   Save                ⌃O   Export to a new file",
     "⌃F   Find                ⌃G   Find exactly",
     "Tab  Next match          ⇧Tab Previous match",
@@ -120,9 +124,18 @@ const HELP_LINES: &[&str] = &[
     "and turns かな into kanji (しんじゅく finds 新宿).",
 ];
 
-enum PromptKind {
+/// What a file name prompt writes to.
+#[derive(Clone, Copy)]
+enum WriteKind {
+    /// A copy; the buffer stays bound to its own file.
     Export,
-    ConfirmOverwrite(PathBuf),
+    /// Name the buffer, for text read from standard input.
+    SaveAs { then_quit: bool },
+}
+
+enum PromptKind {
+    FileName(WriteKind),
+    ConfirmOverwrite(PathBuf, WriteKind),
     Search { exact: bool },
     ConfirmQuit,
 }
@@ -138,8 +151,9 @@ struct Prompt {
 impl Prompt {
     fn label(&self) -> &'static str {
         match self.kind {
-            PromptKind::Export => "Export to: ",
-            PromptKind::ConfirmOverwrite(_) => "File exists. Overwrite?  (Y)es  (N)o ",
+            PromptKind::FileName(WriteKind::Export) => "Export to: ",
+            PromptKind::FileName(WriteKind::SaveAs { .. }) => "Save as: ",
+            PromptKind::ConfirmOverwrite(..) => "File exists. Overwrite?  (Y)es  (N)o ",
             PromptKind::Search { exact: false } => "Find: ",
             PromptKind::Search { exact: true } => "Find exactly: ",
             PromptKind::ConfirmQuit => "Save modified buffer?  (Y)es  (N)o  (⌃C) Cancel ",
@@ -157,7 +171,7 @@ impl Prompt {
     fn is_yes_no(&self) -> bool {
         matches!(
             self.kind,
-            PromptKind::ConfirmOverwrite(_) | PromptKind::ConfirmQuit
+            PromptKind::ConfirmOverwrite(..) | PromptKind::ConfirmQuit
         )
     }
 }
@@ -214,8 +228,13 @@ enum Motion {
 pub struct Editor {
     buf: Buffer,
     theme: Theme,
-    /// Keep clipboard contents inside zencode: no OSC 52 out, no pastes in.
-    sandboxed: bool,
+    /// Command line switches. `sandboxed` keeps clipboard contents inside
+    /// zencode: no OSC 52 out, no pastes in.
+    settings: Settings,
+    /// A `-B` backup was already made this session.
+    backed_up: bool,
+    /// Which of several files on the command line this is, and how many.
+    file_number: Option<(usize, usize)>,
     /// Cursor row and grapheme index within that row.
     cy: usize,
     cx: usize,
@@ -249,13 +268,45 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(path: PathBuf, sandboxed: bool) -> Result<Self> {
-        let (buf, created) = Buffer::open(&path)?;
+    /// Open a file, or take `stdin_text` for `-`. Files that don't exist
+    /// are created, except with `-n` / `--noread`, where nothing is read
+    /// or created until the first save.
+    pub fn new(source: Source, stdin_text: &str, settings: Settings) -> Result<Self> {
+        let (mut buf, status) = match source {
+            Source::Stdin => {
+                let buf = Buffer::from_text(None, stdin_text);
+                let n = buf.lines.len();
+                (
+                    buf,
+                    format!("Read {n} line{} from standard input", plural(n)),
+                )
+            }
+            Source::Path(path) if settings.no_read => {
+                let mut buf = Buffer::from_text(Some(path), "");
+                buf.line_ending = LineEnding::native();
+                (buf, "New buffer; the file was not read".to_string())
+            }
+            Source::Path(path) => match Buffer::open(&path)? {
+                (buf, true) => (buf, format!("Created {}", path.display())),
+                (buf, false) => {
+                    let n = buf.lines.len();
+                    (buf, format!("Read {n} line{}", plural(n)))
+                }
+            },
+        };
+        if !settings.no_newlines {
+            buf.final_newline = true;
+        }
+        if settings.unix {
+            buf.line_ending = LineEnding::Lf;
+        }
         let (width, height) = terminal::size()?;
         let mut ed = Self {
             buf,
             theme: Theme::sakura(ColorDepth::detect()),
-            sandboxed,
+            settings,
+            backed_up: false,
+            file_number: None,
             cy: 0,
             cx: 0,
             want_col: 0,
@@ -279,13 +330,56 @@ impl Editor {
             follow_cursor: true,
             quit: false,
         };
-        if created {
-            ed.set_status(format!("Created {}", path.display()));
-        } else {
-            let n = ed.buf.lines.len();
-            ed.set_status(format!("Read {n} line{}", plural(n)));
-        }
+        ed.set_status(status);
         Ok(ed)
+    }
+
+    /// Shown in the title bar when several files were given.
+    pub fn set_file_number(&mut self, n: usize, of: usize) {
+        self.file_number = Some((n, of));
+    }
+
+    /// Place the cursor as asked on the command line: `+LINE,COL`,
+    /// `FILE:LINE:COL` or `+/STRING`.
+    pub fn goto(&mut self, goto: &Goto) {
+        match goto {
+            Goto::Line { line, col } => {
+                let rows = self.buf.lines.len() as i64;
+                let row = if *line < 0 { rows + line } else { line - 1 };
+                let row = row.clamp(0, rows - 1) as usize;
+                let len = self.buf.line_len(row) as i64;
+                let col = match *col {
+                    Some(c) if c < 0 => len + 1 + c,
+                    Some(c) => c - 1,
+                    None => 0,
+                };
+                self.move_to((row, col.clamp(0, len) as usize));
+            }
+            Goto::Search {
+                query,
+                backward,
+                exact,
+                regex,
+            } => {
+                if query.is_empty() {
+                    return;
+                }
+                let matches = Matcher::new(query, *exact).find_all(&self.buf.lines);
+                let found = if *backward {
+                    matches.last()
+                } else {
+                    matches.first()
+                };
+                match found {
+                    Some(m) => self.move_to((m.row, m.start)),
+                    None => self.set_status(format!("\"{query}\" not found")),
+                }
+                if *regex {
+                    self.set_status("Regular expressions aren't supported; searched for the text");
+                }
+                self.last_search = query.clone();
+            }
+        }
     }
 
     pub fn run(&mut self, out: &mut impl Write) -> Result<()> {
@@ -325,7 +419,10 @@ impl Editor {
         match action {
             Action::Exit => self.try_quit(),
             Action::Save => self.save(false),
-            Action::Export => self.open_prompt(PromptKind::Export),
+            Action::Export if self.settings.restricted => {
+                self.set_error("Restricted mode: exporting is disabled")
+            }
+            Action::Export => self.open_prompt(PromptKind::FileName(WriteKind::Export)),
             Action::Find => self.open_search(false),
             Action::FindExact => self.open_search(true),
             Action::Help => self.show_help = true,
@@ -360,6 +457,8 @@ impl Editor {
             // the kitty keyboard protocol; elsewhere it exits gracefully.
             KeyCode::Char(c) if ctrl && (c == 'X' || (c == 'x' && shift)) => self.quit = true,
             KeyCode::Char('x') if ctrl => self.perform(Action::Exit),
+            // Alternatives to ⌃X, for terminals where it doesn't get through.
+            KeyCode::Char('q' | 'Q') if ctrl || alt => self.perform(Action::Exit),
             KeyCode::Char('s') if ctrl => self.perform(Action::Save),
             KeyCode::Char('o') if ctrl => self.perform(Action::Export),
             KeyCode::Char('f') if ctrl => self.perform(Action::Find),
@@ -413,8 +512,8 @@ impl Editor {
             }
             KeyCode::Backspace => self.backspace(),
             KeyCode::Delete => self.delete(),
-            KeyCode::Enter => self.edit(EditKind::Other, |e| e.insert("\n")),
-            KeyCode::Tab => self.edit(EditKind::Type, |e| e.insert("\t")),
+            KeyCode::Enter => self.edit(EditKind::Other, Self::newline),
+            KeyCode::Tab => self.edit(EditKind::Type, Self::tab),
             KeyCode::Char(c) if !ctrl && !alt => {
                 self.edit(EditKind::Type, |e| e.insert(c.encode_utf8(&mut [0; 4])))
             }
@@ -563,7 +662,7 @@ impl Editor {
     /// Bracketed paste: text coming from the system clipboard via the
     /// terminal (⌘V, ⌃⇧V, middle click).
     fn on_paste(&mut self, s: &str) {
-        if self.sandboxed {
+        if self.settings.sandboxed {
             self.set_error("Sandboxed: pasting from the system clipboard is blocked");
             return;
         }
@@ -605,7 +704,7 @@ impl Editor {
             match p.kind {
                 PromptKind::ConfirmQuit if yes => self.save(true),
                 PromptKind::ConfirmQuit => self.quit = true,
-                PromptKind::ConfirmOverwrite(path) if yes => self.export_to(path),
+                PromptKind::ConfirmOverwrite(path, kind) if yes => self.write_kind(path, kind),
                 _ => self.set_status("Cancelled"),
             }
             return;
@@ -650,16 +749,16 @@ impl Editor {
 
     fn submit_prompt(&mut self, p: Prompt) {
         match p.kind {
-            PromptKind::Export => {
+            PromptKind::FileName(kind) => {
                 if p.input.is_empty() {
                     self.set_status("Cancelled");
                     return;
                 }
                 let path = PathBuf::from(p.input);
                 if path.exists() {
-                    self.open_prompt(PromptKind::ConfirmOverwrite(path));
+                    self.open_prompt(PromptKind::ConfirmOverwrite(path, kind));
                 } else {
-                    self.export_to(path);
+                    self.write_kind(path, kind);
                 }
             }
             PromptKind::Search { .. } => {
@@ -675,7 +774,7 @@ impl Editor {
                 }
                 self.last_search = p.input;
             }
-            PromptKind::ConfirmOverwrite(_) | PromptKind::ConfirmQuit => {}
+            PromptKind::ConfirmOverwrite(..) | PromptKind::ConfirmQuit => {}
         }
     }
 
@@ -686,16 +785,43 @@ impl Editor {
     }
 
     fn try_quit(&mut self) {
-        if self.dirty() {
-            self.open_prompt(PromptKind::ConfirmQuit);
-        } else {
+        if !self.dirty() {
             self.quit = true;
+        } else if self.settings.save_on_exit {
+            self.save(true);
+        } else {
+            self.open_prompt(PromptKind::ConfirmQuit);
         }
     }
 
+    /// Save to the buffer's own file, asking for a name if it has none.
     fn save(&mut self, then_quit: bool) {
-        match self.buf.save() {
+        if self.settings.view {
+            self.set_error(VIEW_ONLY);
+            return;
+        }
+        match self.buf.path.clone() {
+            Some(path) => self.save_to(path, then_quit),
+            None => self.open_prompt(PromptKind::FileName(WriteKind::SaveAs { then_quit })),
+        }
+    }
+
+    fn write_kind(&mut self, path: PathBuf, kind: WriteKind) {
+        match kind {
+            WriteKind::Export => self.export_to(path),
+            WriteKind::SaveAs { then_quit } => self.save_to(path, then_quit),
+        }
+    }
+
+    /// Write the buffer to `path` and bind it there.
+    fn save_to(&mut self, path: PathBuf, then_quit: bool) {
+        if let Err(e) = self.backup(&path) {
+            self.set_error(format!("Error writing backup: {e:#}"));
+            return;
+        }
+        match self.buf.write_to(&path) {
             Ok(n) => {
+                self.buf.path = Some(path);
                 self.saved_state = self.state;
                 self.history.break_step();
                 self.set_status(format!("Wrote {n} line{}", plural(n)));
@@ -705,6 +831,30 @@ impl Editor {
             }
             Err(e) => self.set_error(format!("Error writing: {e:#}")),
         }
+    }
+
+    /// `-B` / `-C DIR`: before the first save, keep the file as it was in
+    /// `NAME~`, or in DIR with the full path in the name (`/` becomes `!`).
+    fn backup(&mut self, path: &Path) -> Result<()> {
+        let s = &self.settings;
+        if !s.backup || s.restricted || self.backed_up || !path.is_file() {
+            return Ok(());
+        }
+        let target = match &s.backup_dir {
+            Some(dir) => {
+                let full = std::path::absolute(path)?;
+                let name = full.to_string_lossy().replace(['/', '\\', ':'], "!");
+                dir.join(format!("{name}~"))
+            }
+            None => {
+                let mut name = path.as_os_str().to_owned();
+                name.push("~");
+                PathBuf::from(name)
+            }
+        };
+        fs::copy(path, &target).with_context(|| format!("copying to {}", target.display()))?;
+        self.backed_up = true;
+        Ok(())
     }
 
     /// Write a copy to `path`; the buffer stays bound to its own file.
@@ -723,6 +873,35 @@ impl Editor {
         self.delete_selection();
         (self.cy, self.cx) = self.buf.insert_str(self.cy, self.cx, s);
         self.sync_want_col();
+    }
+
+    /// Enter. With `-i` / `--autoindent` the new line starts with the
+    /// current line's indentation (as much of it as is left of the cursor).
+    fn newline(&mut self) {
+        let mut text = String::from("\n");
+        if self.settings.autoindent {
+            let (row, col) = self
+                .selection()
+                .map_or((self.cy, self.cx), |(start, _)| start);
+            text.extend(
+                self.buf.lines[row]
+                    .chars()
+                    .take_while(|&c| c == ' ' || c == '\t')
+                    .take(col),
+            );
+        }
+        self.insert(&text);
+    }
+
+    /// Tab, or spaces up to the next tab stop with `-E` / `--tabstospaces`.
+    fn tab(&mut self) {
+        if !self.settings.tabs_to_spaces {
+            return self.insert("\t");
+        }
+        self.delete_selection();
+        let tab = tab_width();
+        let col = display_col(&self.buf.lines[self.cy], self.cx);
+        self.insert(&" ".repeat(tab - col % tab));
     }
 
     fn backspace(&mut self) {
@@ -795,6 +974,10 @@ impl Editor {
     /// taken when the edit starts a new step, and dropped if nothing
     /// changed.
     fn edit(&mut self, kind: EditKind, f: impl FnOnce(&mut Self)) {
+        if self.settings.view {
+            self.set_error(VIEW_ONLY);
+            return;
+        }
         // Typing over a selection replaces it, which is its own step.
         // Moving a selected block of lines repeatedly is still one step.
         let selection_ok = kind == EditKind::MoveLines || self.selection().is_none();
@@ -856,7 +1039,7 @@ impl Editor {
     }
 
     fn set_clip(&mut self, text: String, linewise: bool) {
-        if !self.sandboxed {
+        if !self.settings.sandboxed {
             let mut system = text.clone();
             if linewise {
                 system.push('\n');
@@ -867,7 +1050,11 @@ impl Editor {
     }
 
     fn clip_status(&mut self, verb: &str, what: String) {
-        let suffix = if self.sandboxed { " (sandboxed)" } else { "" };
+        let suffix = if self.settings.sandboxed {
+            " (sandboxed)"
+        } else {
+            ""
+        };
         self.set_status(format!("{verb} {what}{suffix}"));
     }
 
@@ -894,6 +1081,22 @@ impl Editor {
             let what = describe(&text);
             self.set_clip(text, false);
             self.delete_selection();
+            self.clip_status("Extracted", what);
+        } else if self.settings.cut_from_cursor {
+            // -k: from the cursor to the end of the line, or the line
+            // break when already there.
+            let (cy, cx) = (self.cy, self.cx);
+            let end = if cx < self.buf.line_len(cy) {
+                (cy, self.buf.line_len(cy))
+            } else if cy + 1 < self.buf.lines.len() {
+                (cy + 1, 0)
+            } else {
+                return;
+            };
+            let text = self.buf.text_range((cy, cx), end);
+            let what = describe(&text);
+            self.set_clip(text, false);
+            self.buf.delete_range((cy, cx), end);
             self.clip_status("Extracted", what);
         } else {
             let line = self.buf.cut_line(self.cy);
@@ -1113,7 +1316,11 @@ impl Editor {
             }
         }
         // Never let the bar take more than half of what's left for text.
-        let max_rows = (self.height as usize).saturating_sub(2) / 2;
+        let max_rows = if self.settings.no_help {
+            0
+        } else {
+            (self.height as usize).saturating_sub(2) / 2
+        };
         let rows = SHORTCUTS.len().div_ceil(cols.len()).min(max_rows);
         (cols, rows)
     }
@@ -1239,9 +1446,21 @@ impl Editor {
 
     fn draw_title(&self, out: &mut impl Write) -> Result<()> {
         let t = &self.theme;
-        let name = self.buf.path.display().to_string();
+        let mut name = match &self.buf.path {
+            Some(path) => path.display().to_string(),
+            None => "(standard input)".to_string(),
+        };
+        if let Some((n, of)) = self.file_number {
+            name.push_str(&format!("  ({n}/{of})"));
+        }
         let modified = if self.dirty() { "  [Modified]" } else { "" };
-        let badge = if self.sandboxed { " SANDBOXED " } else { "" };
+        let mut badge = String::new();
+        if self.settings.sandboxed {
+            badge.push_str(" SANDBOXED ");
+        }
+        if self.settings.view {
+            badge.push_str(" VIEW ");
+        }
         let line_text = &self.buf.lines[self.cy];
         let right = format!(
             "Ln {}, Col {}   UTF-8  {}  {} ",
@@ -1263,7 +1482,7 @@ impl Editor {
         } else {
             short
         };
-        let badge_cols = str_width(&prefix)..str_width(&prefix) + str_width(badge);
+        let badge_cols = str_width(&prefix)..str_width(&prefix) + str_width(&badge);
         let left = format!("{prefix}{tail}");
         let (left, lw) = truncate(&left, width);
         let line = if lw + rw < width {
@@ -1574,7 +1793,7 @@ impl Editor {
         let mut lines: Vec<&str> = std::iter::once(header.as_str())
             .chain(HELP_LINES.iter().copied())
             .collect();
-        if self.sandboxed {
+        if self.settings.sandboxed {
             lines.push("Sandboxed: the clipboard never leaves zencode.");
         }
         lines.extend(["", "Press any key to close"]);

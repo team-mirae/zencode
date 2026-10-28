@@ -349,12 +349,13 @@ dependencies = [
 
 [[package]]
 name = "zencode"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
  "crossterm",
  "inputx-nihongo",
+ "libc",
  "unicode-segmentation",
  "unicode-width",
 ]

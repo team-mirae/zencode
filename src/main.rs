@@ -1,5 +1,6 @@
 mod brand;
 mod buffer;
+mod cli;
 mod editor;
 mod history;
 mod letterblock;
@@ -7,23 +8,23 @@ mod search;
 mod text;
 mod theme;
 
-use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
+use std::io::{self, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::cursor::Show;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::style::ResetColor;
+use crossterm::style::{Print, ResetColor};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     supports_keyboard_enhancement,
 };
 
+use cli::{Command, Source};
 use editor::Editor;
 
 fn usage() -> String {
@@ -33,16 +34,40 @@ fn usage() -> String {
 A nano-style terminal editor with first-class 全角 (한글 / 日本語) support
 
 USAGE:
-    zencode [OPTIONS] FILE
+    zencode [OPTIONS] [[+LINE[,COLUMN]] FILE]...
 
-    FILE is created if it doesn't exist. Without FILE, zencode prints its
-    version and exits.
+    FILE is created if it doesn't exist; `-` reads the text from standard
+    input. Several files are edited one after another. Without FILE,
+    zencode prints its version and exits.
+
+    +LINE[,COLUMN]   start at LINE and COLUMN (negative counts from the end)
+    +/TEXT, +?TEXT   start at the first / last match of TEXT; put c before
+                     the / for a case-sensitive (exact) search
+    FILE:LINE[:COL]  also understood, when FILE exists (always with -g / -@)
 
 OPTIONS:
-    -s, --sandboxed    keep the clipboard inside zencode: never write to or
-                       accept pastes from the system clipboard
-    -h, --help         print this help
-    -V, --version      print the version
+    -s, --sandboxed       keep the clipboard inside zencode: never write to
+                          or accept pastes from the system clipboard
+    -g, --goto            read FILE:LINE[:COL] as a position (also -@,
+                          --colonparsing)
+    -v, --view            view only: the buffer can't be changed
+    -t, --saveonexit      save changes on exit without asking
+    -T, --tabsize=N       tab stops every N columns (default 4)
+    -E, --tabstospaces    Tab inserts spaces
+    -i, --autoindent      new lines start with the previous line's indent
+    -L, --nonewlines      don't add a line break at the end of the file
+    -u, --unix            save with LF line endings
+    -k, --cutfromcursor   ⌃B with no selection cuts to the end of the line
+    -B, --backup          keep the original as FILE~ on the first save
+    -C, --backupdir=DIR   keep that backup in DIR instead (implies -B)
+    -n, --noread          start empty and only write the file (for pipes)
+    -R, --restricted      no export and no backups
+    -x, --nohelp          hide the shortcut bar
+        --nomouse         leave the mouse to the terminal
+    -h, --help            print this help
+    -V, --version         print the version
+
+    Other nano options are accepted and ignored, as are -w / --wait.
 
 ENVIRONMENT:
     ZENCODE_COLOR=truecolor|256|16|none   override color detection
@@ -55,21 +80,37 @@ ENVIRONMENT:
 
 /// Whether we pushed kitty keyboard flags and so must pop them on exit.
 static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
+/// Whether we saved the terminal's DEC modes and so must restore them.
+static MODES_SAVED: AtomicBool = AtomicBool::new(false);
+
+/// DEC private modes zencode changes but a parent program may rely on:
+/// bracketed paste (2004) and cursor visibility (25). A program that
+/// hands zencode its terminal, like Claude Code, can have them on and not
+/// turn them back on afterwards. XTSAVE / XTRESTORE put back whatever was
+/// there; terminals without them ignore both, and the modes end up off and
+/// visible, as before.
+const SAVE_MODES: &str = "\x1b[?2004s\x1b[?25s";
+const RESTORE_MODES: &str = "\x1b[?2004r\x1b[?25r";
 
 /// Puts the terminal into raw/alternate-screen mode and restores it on drop,
 /// including when unwinding from a panic.
 struct TerminalGuard;
 
 impl TerminalGuard {
-    fn enter() -> Result<Self> {
+    fn enter(mouse: bool) -> Result<Self> {
         enable_raw_mode()?;
+        if execute!(io::stdout(), Print(SAVE_MODES)).is_ok() {
+            MODES_SAVED.store(true, Ordering::SeqCst);
+        }
         execute!(io::stdout(), EnterAlternateScreen)?;
         // Not every console supports bracketed paste; it's fine without it.
         // Sandboxed mode relies on it to recognize and refuse pastes.
         let _ = execute!(io::stdout(), EnableBracketedPaste);
         // Clicks, drags and the wheel. The terminal's own mouse selection
         // then needs a modifier (⌥ on macOS, ⇧ on most Linux terminals).
-        let _ = execute!(io::stdout(), EnableMouseCapture);
+        if mouse {
+            let _ = execute!(io::stdout(), EnableMouseCapture);
+        }
         // The kitty keyboard protocol lets ⌃⇧X arrive as something other
         // than plain ⌃X. Terminals without it just send ⌃X.
         if matches!(supports_keyboard_enhancement(), Ok(true))
@@ -98,36 +139,103 @@ fn restore_terminal() {
     let _ = execute!(io::stdout(), DisableMouseCapture);
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     let _ = execute!(io::stdout(), ResetColor, Show, LeaveAlternateScreen);
+    if MODES_SAVED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), Print(RESTORE_MODES));
+    }
     let _ = disable_raw_mode();
 }
 
-fn main() -> Result<()> {
-    let mut path = None;
-    let mut sandboxed = false;
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
-            "-h" | "--help" => {
-                println!("{}", usage());
-                return Ok(());
-            }
-            "-V" | "--version" => {
-                println!("{} {}", brand::full_name(), brand::VERSION);
-                return Ok(());
-            }
-            "-s" | "--sandboxed" => sandboxed = true,
-            a if a.starts_with('-') && a != "-" => {
-                anyhow::bail!("unknown option {a}\n\n{}", usage())
-            }
-            _ if path.is_none() => path = Some(PathBuf::from(arg)),
-            _ => anyhow::bail!("only one file can be opened at a time\n\n{}", usage()),
-        }
+/// Put the terminal back on stdin once piped input has been read. This
+/// opens the terminal's own device (like /dev/ttys003) rather than
+/// /dev/tty, which crossterm would fall back to but macOS can't poll.
+#[cfg(unix)]
+fn reattach_stdin() -> io::Result<()> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+
+    let device = [libc::STDOUT_FILENO, libc::STDERR_FILENO]
+        .into_iter()
+        .find_map(|fd| {
+            // SAFETY: ttyname returns null or a C string that stays valid
+            // until the next call; it's copied out right away.
+            let name = unsafe { libc::ttyname(fd) };
+            let name = (!name.is_null()).then(|| unsafe { CStr::from_ptr(name) })?;
+            Some(PathBuf::from(OsStr::from_bytes(name.to_bytes())))
+        })
+        .unwrap_or_else(|| PathBuf::from("/dev/tty"));
+    let tty = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(device)?;
+    // SAFETY: both are open descriptors; dup2 replaces stdin atomically.
+    if unsafe { libc::dup2(tty.as_raw_fd(), libc::STDIN_FILENO) } < 0 {
+        return Err(io::Error::last_os_error());
     }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    // Errors go to stderr before the terminal is touched, so the program
+    // that started zencode as $EDITOR can show them.
+    let command = match cli::parse(std::env::args().skip(1), |p| p.exists()) {
+        Ok(command) => command,
+        Err(e) => {
+            eprintln!("zencode: {e}\nRun `zencode --help` for usage.");
+            std::process::exit(1);
+        }
+    };
+    let (settings, tab_size, files) = match command {
+        Command::Help => {
+            println!("{}", usage());
+            return Ok(());
+        }
+        Command::Version => {
+            println!("{} {}", brand::full_name(), brand::VERSION);
+            return Ok(());
+        }
+        Command::Edit {
+            settings,
+            tab_size,
+            files,
+        } => (settings, tab_size, files),
+    };
     // zencode never invents a file name: no file means "just tell me
     // what you are".
-    let Some(path) = path else {
+    if files.is_empty() {
         println!("{} {}", brand::full_name(), brand::VERSION);
         return Ok(());
-    };
+    }
+    if let Some(n) = tab_size {
+        text::set_tab_width(n);
+    }
+
+    // With `-`, read all of stdin first; keyboard input then comes from
+    // the terminal. (On Windows crossterm reads CONIN$ anyway.)
+    let mut stdin_text = String::new();
+    if files.iter().any(|f| f.source == Source::Stdin) {
+        io::stdin()
+            .read_to_string(&mut stdin_text)
+            .context("reading standard input")?;
+        #[cfg(unix)]
+        reattach_stdin().context("opening the terminal for keyboard input")?;
+    }
+
+    // Open everything up front, so a bad file is reported before the
+    // screen changes.
+    let count = files.len();
+    let mut editors = Vec::with_capacity(count);
+    for (i, file) in files.into_iter().enumerate() {
+        let mut editor = Editor::new(file.source, &stdin_text, settings.clone())?;
+        if count > 1 {
+            editor.set_file_number(i + 1, count);
+        }
+        if let Some(goto) = &file.goto {
+            editor.goto(goto);
+        }
+        editors.push(editor);
+    }
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -135,10 +243,11 @@ fn main() -> Result<()> {
         default_hook(info);
     }));
 
-    let mut editor = Editor::new(path, sandboxed)?;
-    let _guard = TerminalGuard::enter()?;
+    let _guard = TerminalGuard::enter(!settings.no_mouse)?;
     let mut out = BufWriter::with_capacity(1 << 16, io::stdout().lock());
-    editor.run(&mut out)?;
+    for mut editor in editors {
+        editor.run(&mut out)?;
+    }
     out.flush()?;
     Ok(())
 }

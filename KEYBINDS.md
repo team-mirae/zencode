@@ -21,6 +21,16 @@ for you. Your files should be named by you, not a program's suggestions.
 
 Just running `zencode` is treated equally as `zencode --version`.
 
+Text piped in with `zencode -` is the one exception: it has no name yet, so
+saving it (`⌃S`, or answering yes when exiting) asks you for one.
+
+Several files can be given at once. They are edited one after another:
+`⌃X` (or `⌃⇧X`) closes the current file and moves on to the next.
+
+The command line follows `nano`, so zencode can be your `$EDITOR`.
+`+LINE,COLUMN` and `+/text` place the caret, as do `-g file:line:column`
+and `file:line`. See the README for every option.
+
 ## Core principle
 
 We try to preserve as much as we can from `nano` - the program which inspired this
@@ -51,6 +61,12 @@ Exiting a text editor should be easy. It follows `nano` conventions.
 - `⌃X` to **Exit** gracefully. Unsaved changes will prompt a warning.
 - `⌃⇧X` to **Exit without warning**.
 
+Exiting must always work, so graceful exit has two more keybinds, one on each
+layer, in case a terminal or the program that started zencode swallows `⌃X`.
+Q stands for quit.
+
+- `⌃Q` or `⌥Q` to **Exit** gracefully, exactly like `⌃X`.
+
 ## Disk I/O
 
 A file is read by launching the program via `zencode filename.extension`.
@@ -60,6 +76,9 @@ Saving follows `nano` conventions.
 
 - `⌃O` to **Export** to new file.
 - `⌃S` to **Save** to current file.
+
+With `-t` / `--saveonexit`, `⌃X` saves without asking. With `-v` / `--view`,
+nothing can be changed or saved.
 
 ## Clipboard access
 
