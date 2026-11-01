@@ -142,6 +142,7 @@ fn already_on_alternate_screen() -> bool {
 }
 
 /// `reply` holds a complete primary device attributes answer (`ESC [ ? … c`).
+#[cfg_attr(not(unix), allow(dead_code))]
 fn da1_complete(reply: &[u8]) -> bool {
     (0..reply.len()).any(|i| {
         let Some(rest) = reply[i..].strip_prefix(b"\x1b[?") else {
@@ -156,6 +157,7 @@ fn da1_complete(reply: &[u8]) -> bool {
 }
 
 /// The DECRQM answer `ESC [ ? 1049 ; Ps $ y` says set (1) or permanently set (3).
+#[cfg_attr(not(unix), allow(dead_code))]
 fn alternate_screen_reported(reply: &[u8]) -> bool {
     [b"\x1b[?1049;1$y", b"\x1b[?1049;3$y"]
         .iter()
