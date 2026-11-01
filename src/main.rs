@@ -92,6 +92,76 @@ static MODES_SAVED: AtomicBool = AtomicBool::new(false);
 const SAVE_MODES: &str = "\x1b[?2004s\x1b[?25s";
 const RESTORE_MODES: &str = "\x1b[?2004r\x1b[?25r";
 
+/// Whether zencode switched to the alternate screen itself and so must
+/// switch back on exit.
+static ENTERED_ALTERNATE: AtomicBool = AtomicBool::new(false);
+const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
+
+/// Asks the terminal whether the alternate screen (mode 1049) is already
+/// on: DECRQM, followed by a primary device attributes request that every
+/// terminal answers, so one without DECRQM costs a round trip rather than
+/// the whole timeout. Expects raw mode. No answer, or no tty: false.
+#[cfg(unix)]
+fn already_on_alternate_screen() -> bool {
+    use std::time::{Duration, Instant};
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        return false;
+    }
+    if execute!(io::stdout(), Print("\x1b[?1049$p\x1b[c")).is_err() {
+        return false;
+    }
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let mut reply = Vec::new();
+    while !da1_complete(&reply) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let mut fds = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd; read into a local buffer of its length.
+        if unsafe { libc::poll(&mut fds, 1, left.as_millis() as libc::c_int) } <= 0 {
+            break;
+        }
+        let mut buf = [0u8; 256];
+        let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        reply.extend_from_slice(&buf[..n as usize]);
+    }
+    alternate_screen_reported(&reply)
+}
+
+#[cfg(not(unix))]
+fn already_on_alternate_screen() -> bool {
+    false
+}
+
+/// `reply` holds a complete primary device attributes answer (`ESC [ ? … c`).
+fn da1_complete(reply: &[u8]) -> bool {
+    (0..reply.len()).any(|i| {
+        let Some(rest) = reply[i..].strip_prefix(b"\x1b[?") else {
+            return false;
+        };
+        let params = rest
+            .iter()
+            .take_while(|b| b.is_ascii_digit() || **b == b';')
+            .count();
+        rest.get(params) == Some(&b'c')
+    })
+}
+
+/// The DECRQM answer `ESC [ ? 1049 ; Ps $ y` says set (1) or permanently set (3).
+fn alternate_screen_reported(reply: &[u8]) -> bool {
+    [b"\x1b[?1049;1$y", b"\x1b[?1049;3$y"]
+        .iter()
+        .any(|r| reply.windows(r.len()).any(|w| w == *r))
+}
+
 /// Puts the terminal into raw/alternate-screen mode and restores it on drop,
 /// including when unwinding from a panic.
 struct TerminalGuard;
@@ -102,7 +172,17 @@ impl TerminalGuard {
         if execute!(io::stdout(), Print(SAVE_MODES)).is_ok() {
             MODES_SAVED.store(true, Ordering::SeqCst);
         }
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        if already_on_alternate_screen() {
+            // Started from a full-screen program (Claude Code's ⌃G, for one)
+            // that didn't hand over its screen. There is only one alternate
+            // screen, so entering it again does nothing, and leaving it on
+            // exit would drop that program onto the normal screen while it
+            // still draws as if it were full-screen. Stay on its screen.
+            execute!(io::stdout(), Print(CLEAR_SCREEN))?;
+        } else {
+            execute!(io::stdout(), EnterAlternateScreen)?;
+            ENTERED_ALTERNATE.store(true, Ordering::SeqCst);
+        }
         // Not every console supports bracketed paste; it's fine without it.
         // Sandboxed mode relies on it to recognize and refuse pastes.
         let _ = execute!(io::stdout(), EnableBracketedPaste);
@@ -138,7 +218,12 @@ fn restore_terminal() {
     }
     let _ = execute!(io::stdout(), DisableMouseCapture);
     let _ = execute!(io::stdout(), DisableBracketedPaste);
-    let _ = execute!(io::stdout(), ResetColor, Show, LeaveAlternateScreen);
+    if ENTERED_ALTERNATE.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), ResetColor, Show, LeaveAlternateScreen);
+    } else {
+        // Nested: leave the parent's alternate screen blank for it to redraw.
+        let _ = execute!(io::stdout(), ResetColor, Show, Print(CLEAR_SCREEN));
+    }
     if MODES_SAVED.swap(false, Ordering::SeqCst) {
         let _ = execute!(io::stdout(), Print(RESTORE_MODES));
     }
@@ -250,4 +335,27 @@ fn main() -> Result<()> {
     }
     out.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_alternate_screen_state() {
+        assert!(alternate_screen_reported(b"\x1b[?1049;1$y\x1b[?62;22c"));
+        assert!(alternate_screen_reported(b"\x1b[?1049;3$y"));
+        assert!(!alternate_screen_reported(b"\x1b[?1049;2$y\x1b[?62;22c"));
+        assert!(!alternate_screen_reported(b"\x1b[?1049;0$y"));
+        // A terminal without DECRQM only answers the DA1 request.
+        assert!(!alternate_screen_reported(b"\x1b[?62;22c"));
+    }
+
+    #[test]
+    fn waits_for_device_attributes() {
+        assert!(da1_complete(b"\x1b[?1049;1$y\x1b[?62;22c"));
+        assert!(da1_complete(b"\x1b[?6c"));
+        assert!(!da1_complete(b"\x1b[?1049;1$y"));
+        assert!(!da1_complete(b"\x1b[?62;2"));
+    }
 }
