@@ -62,6 +62,7 @@ OPTIONS:
     -C, --backupdir=DIR   keep that backup in DIR instead (implies -B)
     -n, --noread          start empty and only write the file (for pipes)
     -R, --restricted      no export and no backups
+        --nosoftwrap      start with word wrap off (⌃L toggles it)
     -x, --nohelp          hide the shortcut bar
         --nomouse         leave the mouse to the terminal
     -h, --help            print this help

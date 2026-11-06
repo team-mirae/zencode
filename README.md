@@ -87,6 +87,7 @@ nano's behaviour options are supported where zencode has the feature:
 | `-C DIR`, `--backupdir` | Keep that backup in DIR instead, named after the full path (implies `-B`) |
 | `-n`, `--noread`        | Start empty and only write the file (named pipes)    |
 | `-R`, `--restricted`    | No export (⌃O) and no backups                        |
+| `--nosoftwrap`          | Start with word wrap off (⌃L turns it back on)       |
 | `-x`, `--nohelp`        | Hide the shortcut bar                                |
 | `--nomouse`             | Leave the mouse to the terminal                      |
 
@@ -122,6 +123,7 @@ shown in the shortcut bar at the bottom of the screen.
 | ⌃⌦ or ⌥⌦          | Delete letterblock right     |
 | ⌃↑↓ or ⌥↑↓        | Move line up / down          |
 | ⌃F / ⌃G           | Find / find exactly          |
+| ⌃L or ⌥Z          | Word wrap on / off           |
 | Tab / ⇧Tab        | Next / previous match        |
 | ⌃/ or F1          | Help                         |
 
@@ -130,6 +132,19 @@ With nothing selected, ⌃C and ⌃B act on the whole line.
 Undo works in steps. A run of typing, backspacing or line moves at one spot
 is one step, like an insert-mode run in vim. Enter, paste and extract are
 steps of their own, and moving the cursor starts a new one.
+
+### Word wrap
+
+Long lines wrap onto the rows below instead of running off the right
+edge. This only changes how the text is shown: no line breaks are added
+to the file. Rows break between words, so English and 한국어 words stay
+whole, while 日本語, which has no spaces, breaks between any two
+characters except before closing punctuation like 。 and 」. A word too
+long for a row is split wherever it reaches the edge.
+
+↑↓ and PgUp / PgDn move by screen row, and the line number is shown only
+on a line's first row. ⌃L (or ⌥Z, as in VS Code) turns wrapping off to
+scroll long lines sideways instead, and `--nosoftwrap` starts that way.
 
 ### Letterblocks
 
@@ -155,7 +170,7 @@ select the line. The wheel scrolls the view without moving the cursor.
 
 Shortcuts in the bar can be clicked too, and highlight when the pointer is
 over them: Exit, Save, Export, Find, Find Exact, Help, Copy, Extract,
-Paste, Select All, Undo and Redo. Force Exit is deliberately not
+Paste, Select All, Undo, Redo and Wrap. Force Exit is deliberately not
 clickable, and movement keys like Letterblock and Move Line are only hints.
 
 zencode captures the mouse, so for your terminal's own text selection hold

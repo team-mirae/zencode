@@ -12,6 +12,7 @@
 //! shortcut bar are the exception; they are measured with the same width
 //! rules as the text, so `ZENCODE_AMBIGUOUS_WIDE=1` keeps the layout right.
 
+use std::cell::RefCell;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -39,8 +40,8 @@ use crate::history::{EditKind, History, Snapshot};
 use crate::letterblock;
 use crate::search::{Match, Matcher};
 use crate::text::{
-    display_col, gidx_for_col, grapheme_count, grapheme_width, is_control, str_width, tab_width,
-    truncate, width_at,
+    Segment, display_col, gidx_for_col, grapheme_count, grapheme_width, is_control, str_width,
+    tab_width, truncate, width_at, wrap,
 };
 use crate::theme::{ColorDepth, Rgb, Theme};
 
@@ -75,6 +76,7 @@ const SHORTCUTS: &[(&str, &str, Option<Action>)] = &[
     ("⌃E/⌥E", "Undo", Some(Action::Undo)),
     ("⌃↑↓/⌥↑↓", "Move Line", None),
     ("⌃R/⌥R", "Redo", Some(Action::Redo)),
+    ("⌃L/⌥Z", "Wrap", Some(Action::Wrap)),
 ];
 
 /// Commands reachable from both a key and a click on the shortcut bar.
@@ -92,6 +94,7 @@ enum Action {
     SelectAll,
     Undo,
     Redo,
+    Wrap,
 }
 
 /// Shown below the brand header in the help box.
@@ -107,6 +110,7 @@ const HELP_LINES: &[&str] = &[
     "⌃C   Copy                ⌃B   Extract (cut)",
     "⌃V   Paste               ⌃A   Select all",
     "⌃E   Undo  (or ⌥E)       ⌃R   Redo  (or ⌥R)",
+    "⌃L   Word wrap on / off  (or ⌥Z)",
     "",
     "⇧ + any movement         Extend the selection",
     "⌃←→  ⌥←→  ⌥B ⌥F          Move by letterblock",
@@ -242,8 +246,14 @@ pub struct Editor {
     want_col: usize,
     /// Other end of the selection; the cursor is always one end.
     anchor: Option<Pos>,
+    /// First line on screen, and which of its wrapped rows is at the top.
     row_off: usize,
+    sub_off: usize,
+    /// Columns scrolled off to the left; always 0 while wrapping.
     col_off: usize,
+    /// Soft wrap: long lines continue on the rows below instead of
+    /// scrolling sideways. The file itself is never changed.
+    wrap: bool,
     width: u16,
     height: u16,
     status: Option<Status>,
@@ -265,7 +275,19 @@ pub struct Editor {
     /// on its own, and back on with the next key press or click.
     follow_cursor: bool,
     quit: bool,
+    /// The last long line wrapped, so a huge one-line file isn't
+    /// re-wrapped several times for every key press.
+    wrap_cache: RefCell<Option<WrapCache>>,
 }
+
+struct WrapCache {
+    line: String,
+    width: usize,
+    segments: Vec<Segment>,
+}
+
+/// Lines shorter than this (in bytes) are cheap to wrap and not cached.
+const WRAP_CACHE_MIN: usize = 4096;
 
 impl Editor {
     /// Open a file, or take `stdin_text` for `-`. Files that don't exist
@@ -301,6 +323,7 @@ impl Editor {
             buf.line_ending = LineEnding::Lf;
         }
         let (width, height) = terminal::size()?;
+        let wrap = !settings.no_wrap;
         let mut ed = Self {
             buf,
             theme: Theme::sakura(ColorDepth::detect()),
@@ -312,7 +335,9 @@ impl Editor {
             want_col: 0,
             anchor: None,
             row_off: 0,
+            sub_off: 0,
             col_off: 0,
+            wrap,
             width,
             height,
             status: None,
@@ -329,6 +354,7 @@ impl Editor {
             hover: None,
             follow_cursor: true,
             quit: false,
+            wrap_cache: RefCell::new(None),
         };
         ed.set_status(status);
         Ok(ed)
@@ -432,6 +458,7 @@ impl Editor {
             Action::SelectAll => self.select_all(),
             Action::Undo => self.undo(),
             Action::Redo => self.redo(),
+            Action::Wrap => self.toggle_wrap(),
         }
     }
 
@@ -473,6 +500,8 @@ impl Editor {
             KeyCode::Char('a') if ctrl => self.perform(Action::SelectAll),
             KeyCode::Char('e') if ctrl || alt => self.perform(Action::Undo),
             KeyCode::Char('r') if ctrl || alt => self.perform(Action::Redo),
+            KeyCode::Char('l') if ctrl => self.perform(Action::Wrap),
+            KeyCode::Char('z') if alt => self.perform(Action::Wrap),
             // Many terminals send ⌃⌫ as ^H, and iTerm2's "natural text
             // editing" sends ⌥⌫ as ^W and ⌥⌦ as ESC d.
             KeyCode::Char('h' | 'w') if ctrl => self.delete_block(true),
@@ -648,14 +677,22 @@ impl Editor {
         } else {
             return None;
         };
-        let row = (self.row_off + screen_row).min(self.buf.lines.len() - 1);
-        let col = (x as usize).saturating_sub(self.gutter_width()) + self.col_off;
+        let (row, sub) = self.step_visual((self.row_off, self.sub_off), screen_row as isize);
+        let segs = self.segments(row);
+        let x = (x as usize).saturating_sub(self.gutter_width());
+        let seg = segs[sub];
+        let mut col = seg.col + x + self.col_off;
+        // Past the end of a wrapped row, stay on that row: the position
+        // after its last character is where the next row starts.
+        if let Some(next) = segs.get(sub + 1) {
+            let last = next.start.saturating_sub(1).max(seg.start);
+            col = col.min(seg.col_of(&self.buf.lines[row], last));
+        }
         Some((row, col))
     }
 
     fn scroll_view(&mut self, delta: isize) {
-        let last = self.buf.lines.len().saturating_sub(1);
-        self.row_off = self.row_off.saturating_add_signed(delta).min(last);
+        (self.row_off, self.sub_off) = self.step_visual((self.row_off, self.sub_off), delta);
         self.follow_cursor = false;
     }
 
@@ -1230,7 +1267,7 @@ impl Editor {
     // ----- movement ----------------------------------------------------
 
     fn sync_want_col(&mut self) {
-        self.want_col = display_col(&self.buf.lines[self.cy], self.cx);
+        self.want_col = self.cursor_visual().2;
     }
 
     fn move_to(&mut self, (row, gidx): Pos) {
@@ -1285,11 +1322,31 @@ impl Editor {
         }
     }
 
+    /// Move by screen rows, which are wrapped rows while wrapping.
     fn move_vert(&mut self, delta: isize) {
-        let last = self.buf.lines.len() - 1;
-        let row = self.cy.saturating_add_signed(delta).min(last);
+        let (_, sub, _) = self.cursor_visual();
+        let (row, sub) = self.step_visual((self.cy, sub), delta);
+        let segs = self.segments(row);
+        let seg = segs[sub];
+        let limit = match segs.get(sub + 1) {
+            Some(next) => next.start.saturating_sub(1).max(seg.start),
+            None => usize::MAX,
+        };
+        let gidx = seg.gidx_at(&self.buf.lines[row], seg.col + self.want_col, limit);
         self.cy = row;
-        self.cx = gidx_for_col(&self.buf.lines[row], self.want_col);
+        self.cx = gidx;
+    }
+
+    fn toggle_wrap(&mut self) {
+        self.wrap = !self.wrap;
+        self.sub_off = 0;
+        self.col_off = 0;
+        self.sync_want_col();
+        self.set_status(if self.wrap {
+            "Word wrap on"
+        } else {
+            "Word wrap off"
+        });
     }
 
     // ----- layout ------------------------------------------------------
@@ -1340,15 +1397,116 @@ impl Editor {
             .max(1)
     }
 
+    /// Where each screen row of line `row` starts: its first grapheme and
+    /// that grapheme's display column. Just `(0, 0)` unless wrapping.
+    fn segments(&self, row: usize) -> Vec<Segment> {
+        if !self.wrap {
+            return vec![Segment::WHOLE];
+        }
+        let line = &self.buf.lines[row];
+        let width = self.text_width();
+        if line.len() < WRAP_CACHE_MIN {
+            return wrap(line, width);
+        }
+        let mut cache = self.wrap_cache.borrow_mut();
+        if let Some(c) = cache
+            .as_ref()
+            .filter(|c| c.width == width && c.line == *line)
+        {
+            return c.segments.clone();
+        }
+        let segments = wrap(line, width);
+        *cache = Some(WrapCache {
+            line: line.clone(),
+            width,
+            segments: segments.clone(),
+        });
+        segments
+    }
+
+    /// The cursor's wrapped row within its line, and the display column
+    /// it's in on that row: (segments, segment index, column).
+    fn cursor_visual(&self) -> (Vec<Segment>, usize, usize) {
+        let segs = self.segments(self.cy);
+        let sub = segs.partition_point(|s| s.start <= self.cx) - 1;
+        let col = segs[sub].col_of(&self.buf.lines[self.cy], self.cx) - segs[sub].col;
+        (segs, sub, col)
+    }
+
+    /// Move `delta` screen rows from (line, wrapped row) `pos`, stopping at
+    /// either end of the file.
+    fn step_visual(&self, (mut row, mut sub): (usize, usize), delta: isize) -> (usize, usize) {
+        let last = self.buf.lines.len() - 1;
+        if delta > 0 {
+            let mut n = self.segments(row).len();
+            for _ in 0..delta {
+                if sub + 1 < n {
+                    sub += 1;
+                } else if row < last {
+                    row += 1;
+                    sub = 0;
+                    n = self.segments(row).len();
+                } else {
+                    break;
+                }
+            }
+        } else {
+            for _ in 0..delta.unsigned_abs() {
+                if sub > 0 {
+                    sub -= 1;
+                } else if row > 0 {
+                    row -= 1;
+                    sub = self.segments(row).len() - 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        (row, sub)
+    }
+
+    /// Screen row (from the top of the text area) showing wrapped row
+    /// `pos`, if it's on screen.
+    fn screen_row_of(&self, (row, sub): (usize, usize)) -> Option<usize> {
+        let rows = self.text_rows();
+        if (row, sub) < (self.row_off, self.sub_off) {
+            return None;
+        }
+        let mut n = 0;
+        let mut r = self.row_off;
+        let mut first = self.sub_off;
+        while r < row {
+            n += self.segments(r).len() - first;
+            if n >= rows {
+                return None;
+            }
+            first = 0;
+            r += 1;
+        }
+        n += sub - first;
+        (n < rows).then_some(n)
+    }
+
     fn scroll(&mut self) {
+        // Edits and resizes can leave the top of the view past the end.
+        self.row_off = self.row_off.min(self.buf.lines.len() - 1);
+        self.sub_off = self.sub_off.min(self.segments(self.row_off).len() - 1);
         if !self.follow_cursor {
             return;
         }
         let rows = self.text_rows().max(1);
-        if self.cy < self.row_off {
-            self.row_off = self.cy;
-        } else if self.cy >= self.row_off + rows {
-            self.row_off = self.cy + 1 - rows;
+        let (_, sub, _) = self.cursor_visual();
+        let cursor = (self.cy, sub);
+        let top = (self.row_off, self.sub_off);
+        let lowest_top = self.step_visual(cursor, 1 - rows as isize);
+        if cursor < top {
+            (self.row_off, self.sub_off) = cursor;
+        } else if top < lowest_top {
+            (self.row_off, self.sub_off) = lowest_top;
+        }
+        if self.wrap {
+            self.col_off = 0;
+            return;
         }
 
         let line = &self.buf.lines[self.cy];
@@ -1414,9 +1572,10 @@ impl Editor {
 
         // The cursor may be off screen while the wheel scrolls the view.
         let cursor = cursor.or_else(|| {
-            let col = display_col(&self.buf.lines[self.cy], self.cx).checked_sub(self.col_off)?;
-            let row = self.cy.checked_sub(self.row_off)?;
-            (row < self.text_rows() && col < self.text_width())
+            let (_, sub, col) = self.cursor_visual();
+            let col = col.checked_sub(self.col_off)?;
+            let row = self.screen_row_of((self.cy, sub))?;
+            (col < self.text_width())
                 .then(|| ((self.gutter_width() + col) as u16, (1 + row) as u16))
         });
         queue!(out, ResetColor)?;
@@ -1517,8 +1676,9 @@ impl Editor {
         let gutter = self.gutter_width();
         let avail = self.text_width();
 
+        let (mut row, mut sub) = (self.row_off, self.sub_off);
+        let mut segs = self.segments(row);
         for screen_row in 0..self.text_rows() {
-            let row = self.row_off + screen_row;
             queue!(out, MoveTo(0, (1 + screen_row) as u16))?;
 
             let Some(line) = self.buf.lines.get(row) else {
@@ -1540,10 +1700,25 @@ impl Editor {
             if current {
                 queue!(out, SetAttribute(Attribute::Bold))?;
             }
-            queue!(out, Print(format!(" {:>w$} ", row + 1, w = gutter - 2)))?;
+            // Wrapped rows after the first leave the line number blank.
+            if sub == 0 {
+                queue!(out, Print(format!(" {:>w$} ", row + 1, w = gutter - 2)))?;
+            } else {
+                Self::spaces(out, gutter)?;
+            }
             queue!(out, SetAttribute(Attribute::NormalIntensity))?;
 
-            self.draw_line(out, row, line, bg, avail)?;
+            let end = segs.get(sub + 1).map(|s| s.start);
+            self.draw_line(out, row, line, bg, avail, segs[sub], end)?;
+
+            sub += 1;
+            if end.is_none() {
+                row += 1;
+                sub = 0;
+                if row < self.buf.lines.len() {
+                    segs = self.segments(row);
+                }
+            }
         }
         Ok(())
     }
@@ -1568,9 +1743,12 @@ impl Editor {
         Some((start..end, row < r1))
     }
 
-    /// Draw one buffer line clipped to the horizontal viewport. A wide
-    /// character cut by either edge is replaced by an edge marker so the
-    /// columns after it stay aligned.
+    /// Draw one screen row of a buffer line: the graphemes from `seg`
+    /// (first grapheme, its display column) up to `end`, or to the end of
+    /// the line. Unwrapped lines are clipped to the horizontal viewport; a
+    /// wide character cut by either edge is replaced by an edge marker so
+    /// the columns after it stay aligned.
+    #[allow(clippy::too_many_arguments)]
     fn draw_line(
         &self,
         out: &mut impl Write,
@@ -1578,29 +1756,36 @@ impl Editor {
         line: &str,
         bg: Rgb,
         avail: usize,
+        seg: Segment,
+        end: Option<usize>,
     ) -> Result<()> {
+        let col_off = if self.wrap { seg.col } else { self.col_off };
         let t = &self.theme;
         let sel = self.row_selection(row);
         let matches = self.row_matches(row);
-        let mut col = 0;
+        let mut col = seg.col;
         let mut printed = 0;
         let mut clipped = false;
 
-        for (gi, g) in line.graphemes(true).enumerate() {
+        let graphemes = line[seg.byte..].graphemes(true);
+        for (gi, g) in (seg.start..).zip(graphemes) {
+            if end.is_some_and(|e| gi >= e) {
+                break;
+            }
             let start = col;
             let w = grapheme_width(g, col);
             col += w;
-            if col <= self.col_off {
+            if col <= col_off {
                 continue;
             }
-            if start < self.col_off {
-                let n = col - self.col_off;
+            if start < col_off {
+                let n = col - col_off;
                 self.colors(out, t.edge_fg, bg)?;
                 queue!(out, Print("<".repeat(n)))?;
                 printed += n;
                 continue;
             }
-            if col - self.col_off > avail {
+            if col - col_off > avail {
                 let n = avail - printed;
                 self.colors(out, t.edge_fg, bg)?;
                 queue!(out, Print(">".repeat(n)))?;
@@ -1640,8 +1825,8 @@ impl Editor {
         }
 
         // One highlighted cell past the end marks a selected line break.
-        let newline_selected = sel.is_some_and(|(_, nl)| nl);
-        if newline_selected && !clipped && col >= self.col_off && printed < avail {
+        let newline_selected = end.is_none() && sel.is_some_and(|(_, nl)| nl);
+        if newline_selected && !clipped && col >= col_off && printed < avail {
             self.colors(out, t.fg, t.select_bg)?;
             Self::spaces(out, 1)?;
             printed += 1;

@@ -120,6 +120,161 @@ pub fn truncate(s: &str, max: usize) -> (&str, usize) {
     (s, col)
 }
 
+fn is_blank(g: &str) -> bool {
+    matches!(g, " " | "\t" | "\u{3000}")
+}
+
+fn is_hangul(g: &str) -> bool {
+    g.chars().next().is_some_and(|c| {
+        matches!(c, '\u{AC00}'..='\u{D7A3}' | '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}')
+    })
+}
+
+/// Characters that may not start a wrapped row (kinsoku): closing
+/// brackets, punctuation and small kana.
+fn no_row_start(g: &str) -> bool {
+    g.chars().next().is_some_and(|c| {
+        "、。，．・：；？！ー」』）］｝〉》】〕〙〗ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ々〜…‥),.!?:;]}".contains(c)
+    })
+}
+
+/// Characters that may not end a wrapped row: opening brackets.
+fn no_row_end(g: &str) -> bool {
+    g.chars()
+        .next()
+        .is_some_and(|c| "「『（［｛〈《【〔〘〖([{".contains(c))
+}
+
+/// Whether a wrapped row may start at `g` when `prev` comes before it.
+/// Rows break after blanks, and on either side of full-width text such
+/// as 日本語 that has no spaces to break at. 한글 is written with spaces,
+/// so it only breaks at those, keeping words whole.
+fn can_break(prev: &str, g: &str) -> bool {
+    if is_blank(prev) {
+        return !is_blank(g);
+    }
+    if is_blank(g) {
+        return true;
+    }
+    let cjk = |g: &str| grapheme_width(g, 0) > 1 && !is_hangul(g);
+    (cjk(prev) || cjk(g))
+        && !is_hangul(prev)
+        && !is_hangul(g)
+        && !no_row_start(g)
+        && !no_row_end(prev)
+}
+
+/// Where one screen row of a soft-wrapped line starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    /// Index of the row's first grapheme in the line.
+    pub start: usize,
+    /// Display column of that grapheme in the unwrapped line.
+    pub col: usize,
+    /// Byte offset of that grapheme, so work on the row can skip ahead.
+    pub byte: usize,
+}
+
+impl Segment {
+    pub const WHOLE: Segment = Segment {
+        start: 0,
+        col: 0,
+        byte: 0,
+    };
+
+    /// Display column (in the unwrapped line) of grapheme `gidx`, which
+    /// must be at or after the row's start.
+    pub fn col_of(&self, line: &str, gidx: usize) -> usize {
+        let mut col = self.col;
+        for g in line[self.byte..].graphemes(true).take(gidx - self.start) {
+            col += grapheme_width(g, col);
+        }
+        col
+    }
+
+    /// Grapheme from the row's start onwards whose cell covers display
+    /// column `target`, like [`gidx_for_col`]; at most `limit`.
+    pub fn gidx_at(&self, line: &str, target: usize, limit: usize) -> usize {
+        let mut col = self.col;
+        let mut gidx = self.start;
+        for g in line[self.byte..].graphemes(true) {
+            let w = grapheme_width(g, col);
+            if gidx >= limit || col + w > target {
+                break;
+            }
+            col += w;
+            gidx += 1;
+        }
+        gidx.min(limit)
+    }
+}
+
+/// Soft-wrap `s` into rows of at most `width` columns, breaking between
+/// words where it can and anywhere inside a word too long for a row.
+/// The first row always starts at 0. Tabs keep the widths they have in
+/// the unwrapped line.
+///
+/// The cursor can sit after the last character, so a last row that fills
+/// the width exactly gets an empty row after it for the cursor to go to.
+pub fn wrap(s: &str, width: usize) -> Vec<Segment> {
+    let width = width.max(1);
+    let mut rows = vec![Segment::WHOLE];
+    // Display column and byte offset where each grapheme starts, to look
+    // back on a break.
+    let mut cols = Vec::new();
+    let mut col = 0;
+    let mut row_start = Segment::WHOLE;
+    let mut last_break = 0;
+    // Whether the row has non-blank text before the last break
+    // opportunity, before the current grapheme, and since that break.
+    let mut words_before_break = false;
+    let mut row_words = false;
+    let mut words_since_break = false;
+    let mut prev = "";
+    for (i, (byte, g)) in s.grapheme_indices(true).enumerate() {
+        let w = grapheme_width(g, col);
+        cols.push((col, byte));
+        if i > row_start.start && can_break(prev, g) {
+            last_break = i;
+            words_before_break = row_words;
+            words_since_break = false;
+        }
+        if col + w - row_start.col > width && i > row_start.start {
+            // Break at the last opportunity, unless it would leave this
+            // row holding nothing but blanks.
+            let at = if last_break > row_start.start && words_before_break {
+                row_words = words_since_break;
+                last_break
+            } else {
+                row_words = false;
+                i
+            };
+            row_start = Segment {
+                start: at,
+                col: cols[at].0,
+                byte: cols[at].1,
+            };
+            rows.push(row_start);
+            last_break = at;
+            words_since_break = row_words;
+        }
+        if !is_blank(g) {
+            row_words = true;
+            words_since_break = true;
+        }
+        col += w;
+        prev = g;
+    }
+    if col - row_start.col >= width {
+        rows.push(Segment {
+            start: cols.len(),
+            col,
+            byte: s.len(),
+        });
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +317,55 @@ mod tests {
     fn truncate_never_splits_wide_chars() {
         assert_eq!(truncate("日本語", 5), ("日本", 4));
         assert_eq!(truncate("abc", 10), ("abc", 3));
+    }
+    fn rows(s: &str, width: usize) -> Vec<&str> {
+        let starts: Vec<usize> = wrap(s, width).iter().map(|r| r.start).collect();
+        let idx: Vec<usize> = s
+            .grapheme_indices(true)
+            .map(|(i, _)| i)
+            .chain([s.len()])
+            .collect();
+        starts
+            .iter()
+            .enumerate()
+            .map(|(n, &g)| {
+                let end = starts.get(n + 1).map_or(s.len(), |&e| idx[e]);
+                &s[idx[g]..end]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wrap_breaks_between_words() {
+        assert_eq!(rows("hello world foo", 8), ["hello ", "world ", "foo"]);
+        assert_eq!(rows("short", 80), ["short"]);
+        assert_eq!(rows("", 10), [""]);
+    }
+
+    #[test]
+    fn wrap_splits_long_words() {
+        assert_eq!(rows("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn wrap_leaves_room_for_the_cursor() {
+        assert_eq!(rows("abcd", 4), ["abcd", ""]);
+    }
+
+    #[test]
+    fn wrap_keeps_korean_words_whole() {
+        assert_eq!(rows("학교에서는 공부를", 12), ["학교에서는 ", "공부를"]);
+    }
+
+    #[test]
+    fn wrap_breaks_japanese_anywhere_but_kinsoku() {
+        // 。 can't start a row, so it goes with the character before it.
+        assert_eq!(rows("あいう。えお", 6), ["あい", "う。え", "お"]);
+        assert_eq!(rows("日本語", 4), ["日本", "語"]);
+    }
+
+    #[test]
+    fn wrap_never_splits_wide_chars() {
+        assert_eq!(rows("a日本", 4), ["a日", "本"]);
     }
 }

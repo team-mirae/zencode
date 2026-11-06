@@ -22,6 +22,8 @@ pub struct Settings {
     pub backup_dir: Option<PathBuf>,
     pub restricted: bool,
     pub cut_from_cursor: bool,
+    /// Start with soft wrap off.
+    pub no_wrap: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -79,6 +81,8 @@ enum Opt {
     BackupDir,
     Restricted,
     CutFromCursor,
+    SoftWrap,
+    NoSoftWrap,
     /// Accepted and ignored.
     Ignore,
     /// Accepted and ignored, along with its argument.
@@ -114,6 +118,12 @@ const OPTIONS: &[(Option<char>, &str, Opt)] = &[
     (Some('C'), "backupdir", Opt::BackupDir),
     (Some('R'), "restricted", Opt::Restricted),
     (Some('k'), "cutfromcursor", Opt::CutFromCursor),
+    // Soft wrap is on by default; nano turns it on with -S (-$ in older
+    // versions). -w / --nowrap is about hard wrapping, which zencode never
+    // does, so it leaves soft wrap alone.
+    (Some('S'), "softwrap", Opt::SoftWrap),
+    (Some('$'), "softwrap", Opt::SoftWrap),
+    (None, "nosoftwrap", Opt::NoSoftWrap),
     // What zencode already does anyway.
     (Some('l'), "linenumbers", Opt::Ignore),
     (Some('N'), "noconvert", Opt::Ignore),
@@ -121,7 +131,6 @@ const OPTIONS: &[(Option<char>, &str, Opt)] = &[
     (Some('m'), "mouse", Opt::Ignore),
     (Some('Z'), "zap", Opt::Ignore),
     // nano features zencode doesn't have.
-    (Some('S'), "softwrap", Opt::Ignore),
     (Some('0'), "zero", Opt::Ignore),
     (Some('G'), "locking", Opt::Ignore),
     (Some('P'), "positionlog", Opt::Ignore),
@@ -268,6 +277,8 @@ pub fn parse(
                 }
                 Opt::Restricted => settings.restricted = true,
                 Opt::CutFromCursor => settings.cut_from_cursor = true,
+                Opt::SoftWrap => settings.no_wrap = false,
+                Opt::NoSoftWrap => settings.no_wrap = true,
                 Opt::Ignore | Opt::IgnoreArg => {}
             }
         }

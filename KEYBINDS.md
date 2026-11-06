@@ -132,6 +132,13 @@ zencode offers the ability to swap lines with its upper or lower neighbors.
 - `⌃↑` or `⌥↑` to **Move Line Upward**s and move that line to where this is.
 - `⌃↓` or `⌥↓` to **Move Line Downward**s and move that line to where this is.
 
+## Word wrap
+
+Long lines wrap at word boundaries, so a whole paragraph is visible without
+scrolling sideways. Wrapping only affects the screen, never the file.
+
+- `⌃L` or `⌥Z` to toggle **Word Wrap**. `⌥Z` is the same key as VS Code's.
+
 ## State reversal and restoration
 
 State management is done via undo and redo keybinds. Redo was inspired from `vim`,
